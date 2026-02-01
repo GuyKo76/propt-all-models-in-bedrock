@@ -1,0 +1,662 @@
+# RAG System Expert Consultation
+
+## Request
+
+I need expert guidance on optimizing my RAG (Retrieval-Augmented Generation) system. I've built a custom system for research across a corpus of podcast transcripts and documents.
+
+**My three priorities are non-negotiable and must ALL be maximized:**
+
+1. **Accuracy**: Finding ALL relevant content, never missing critical sources
+2. **Speed**: Fast enough for interactive research (<30s target, currently 45-60s)
+3. **Serendipity**: Surfacing unexpected but valuable connections that users didn't know to search for
+
+These are NOT trade-offs. I refuse to sacrifice any one for the others. I need a system that excels at all three simultaneously.
+
+Please review my current architecture and tell me how to achieve this. I suspect I have too many query modes and want guidance on consolidating to a single optimal pipeline.
+
+* * *
+
+## Nothing is Sacred - Challenge Everything
+
+**I want you to be brutally honest.** Don't assume my current approach is reasonable. Challenge every assumption. Tell me if I'm:
+
+* **Overcomplicating things**: Maybe 90% of my architecture is unnecessary and a simple approach would achieve the same goals
+* **Using wrong tools**: Maybe SQLite/sqlite-vec is the wrong choice. Maybe I should use Postgres+pgvector, Pinecone, Weaviate, or something else entirely
+* **Missing obvious solutions**: Maybe there's a well-known pattern that solves my problems that I've never heard of
+* **Wasting effort on marginal gains**: Maybe query expansion adds 2% to my metrics but 20% complexity
+* **Using outdated approaches**: Maybe everything I'm doing was state-of-the-art in 2023 but there are better approaches now
+* **Failing to achieve the three goals**: Maybe my architecture fundamentally cannot deliver on accuracy + speed + serendipity simultaneously, and I need a different approach
+
+**Things I'm willing to throw away:**
+
+* The entire 5-mode system → replace with 1 mode
+* The graph/clustering approach → if there's something better
+* The two-stage (summary → chunk) retrieval → if direct chunk search works better
+* The 4-tier serendipity system → if there's a simpler/better diversity mechanism
+* Cohere embeddings/reranking → if other models are superior
+* Claude for synthesis → if another model is faster without quality loss
+* SQLite + sqlite-vec → if another database is better suited
+* My chunking strategy → if late chunking or other approaches work better
+* Pre-computed summaries → if they're not pulling their weight
+
+**The ONLY non-negotiable requirements (all three must be maximized simultaneously):**
+
+1. **ACCURACY** - Find ALL relevant sources, never miss critical content
+2. **SPEED** - Target <30s end-to-end (currently 45-60s)
+3. **SERENDIPITY** - Surface valuable unexpected connections
+
+These three are NOT trade-offs. I need a system that excels at ALL THREE. If you think this is impossible, explain why and what the theoretical limits are.
+
+**Other constraints:**
+
+* Self-hosted or API-based (no vendor lock-in requirements)
+* Corpus is ~30M words, growing ~10-20 docs/month
+
+**Tell me what's wrong, what's over-engineered, what's missing, and what you would build instead.**
+
+* * *
+
+## Priority 1: Accuracy and Why It Matters
+
+### The Accuracy Problem
+
+My corpus contains specialized content where **missing a relevant source is costly**. Unlike general web search where there are many redundant sources, my corpus has:
+
+* **Unique firsthand accounts**: An eyewitness interview might be the ONLY source for a specific claim
+* **Cross-referencing importance**: Understanding a topic often requires finding ALL sources that mention it, not just the top-5
+* **Contradictory evidence**: I need to surface sources that disagree, not just those that confirm
+
+**Example accuracy failure:** A user asks "What do sources say about the 1954 Eisenhower meeting?" If my system returns 8 sources but misses the 2 most detailed accounts because they used different terminology ("Greada Treaty" vs "Eisenhower meeting"), that's a critical accuracy failure.
+
+### Current Accuracy Mechanisms
+
+1. **Query expansion**: LLM expands queries to cover vocabulary variations
+
+      "tall whites" → ["tall whites", "Nordic aliens", "snow white hair", "Charles Hall", ...]
+
+2. **Two-stage retrieval**: Summary search (document-level) + chunk search (passage-level)
+
+3. **Hybrid search**: Vector search + FTS5 keyword search combined
+
+4. **Reranking**: Cohere Rerank 3.5 re-scores 200 candidates to find top 25-50
+
+5. **Entity-aware search**: Graph stores entities per document for entity-based retrieval
+
+
+### What's Wrong with Current Accuracy
+
+1. **Vocabulary gaps persist**: Query expansion helps but doesn't catch all variations. "Remote viewing" vs "psychic spying" vs "Project Stargate" all refer to the same thing.
+
+2. **Long document burial**: A 100K-word document might mention a key topic once in the middle. The summary might not capture it, and chunk search might rank it low.
+
+3. **Entity disambiguation**: "Bob Lazar" vs "Robert Lazar" vs "Lazar" - same person, different name forms.
+
+4. **Semantic drift**: Vector search returns semantically similar but factually different content. "Roswell crash" query returns documents about other crashes.
+
+5. **Recall unknown**: I don't know what I'm missing. No ground-truth benchmark exists for my corpus.
+
+
+### Questions for the Expert (Accuracy Focus)
+
+1. **How do I maximize recall without drowning in noise?** I want ALL relevant sources but can only show 25-50 chunks to the LLM.
+
+2. **Is query expansion sufficient for vocabulary gaps?** Should I build a domain-specific synonym/alias dictionary instead?
+
+3. **How do I handle long documents?** Multiple summaries? Sliding window search? Hierarchical retrieval?
+
+4. **Should I use entity normalization?** Map all name variants to canonical forms?
+
+5. **What retrieval patterns maximize accuracy?** Multi-query retrieval? Iterative refinement? Hypothetical document embeddings (HyDE)?
+
+6. **How do I know if I'm missing relevant sources?** Evaluation strategies for recall when ground truth doesn't exist?
+
+
+* * *
+
+## Priority 2: Speed and Why It Matters
+
+### The Speed Problem
+
+Current end-to-end latency is **45-60 seconds** for a typical query:
+
+* Retrieval: 15-20s
+* Synthesis: 30-40s
+
+This is too slow for interactive research. Users want to explore iteratively, asking follow-up questions. A 60-second wait breaks the flow.
+
+**Target:** <30 seconds total without sacrificing accuracy or serendipity.
+
+### Current Latency Breakdown
+
+| Stage | Time | Notes |
+| --- | --- | --- |
+| Query expansion (LLM) | ~2s | Sonnet call to expand query |
+| Summary vector search | ~2-3s | sqlite-vec ANN search |
+| Serendipity sampling | ~1s | Graph queries |
+| Chunk retrieval | ~3-5s | Multiple vector searches for expanded terms |
+| FTS5 hybrid search | ~1-2s | Keyword search |
+| Reranking | ~3-5s | Cohere API call |
+| **Total retrieval** | **~15-20s** |     |
+| Synthesis (Opus 4.5) | ~30-40s | The real bottleneck |
+| **Total** | **~45-60s** |     |
+
+### The Synthesis Bottleneck
+
+The biggest bottleneck is **synthesis** (30-40s), not retrieval. Opus 4.5 takes this long to:
+
+* Read 25-50 chunks (~15-20K tokens)
+* Generate a structured response (~2-3K tokens)
+
+**This is hard to optimize** without switching to a faster/smaller model, which risks quality.
+
+### What I've Tried for Speed
+
+1. **Streaming**: Response streams token-by-token, improving perceived latency
+2. **Caching**: LLM responses cached (invalidated when corpus changes)
+3. **Parallel retrieval**: Vector search + FTS5 run in parallel
+4. **Pre-computed summaries**: Summaries generated at index time, not query time
+5. **Pre-computed graph**: Clusters and edges computed offline
+
+### What's Still Slow
+
+1. **Sequential LLM calls**: Query expansion → Librarian → Analyst is 3 serial LLM calls in full mode
+2. **Reranking latency**: 3-5s for Cohere API roundtrip
+3. **Synthesis is irreducible**: Opus quality requires Opus latency
+
+### Questions for the Expert (Speed Focus)
+
+1. **Can I reduce synthesis latency without losing quality?** Would Sonnet 4.5 be sufficient? Smaller context window?
+
+2. **Should I pre-compute more?** Pre-computed answers for common query patterns? Query clustering?
+
+3. **Is reranking worth 3-5s?** Does it improve accuracy enough to justify the latency?
+
+4. **Can retrieval be faster?** Better ANN indexes? Approximate reranking? Fewer retrieval stages?
+
+5. **Should I use speculative execution?** Start synthesis before retrieval completes with partial results?
+
+6. **What's the theoretical minimum latency** for a high-quality RAG system on 30M words? Am I close or far?
+
+7. **Async/streaming patterns?** Should I show intermediate results while synthesis runs?
+
+
+* * *
+
+## Priority 3: Serendipity and Why It Matters
+
+### The Serendipity Problem
+
+My corpus contains ~1,600 podcast transcripts about fringe topics (UFO research, consciousness studies, paranormal phenomena). The **core research value** isn't just finding documents that match a query—it's **discovering unexpected connections** between disparate sources.
+
+**Example:** A user asks about "tall whites" (a UFO classification). Standard RAG would return documents explicitly mentioning "tall whites." But the real value is also surfacing:
+
+* A 1970s interview describing "beings with snow-white hair and translucent skin" (same phenomenon, different vocabulary)
+* An unrelated document about Charles Hall (who coined the term) that provides historical context
+* A skeptical analysis from a completely different cluster that provides counter-evidence
+* A tangentially related document about Nordic alien mythology that provides cultural context
+
+**The fundamental problem:** Vector similarity search creates "filter bubbles"—it converges on semantically similar documents and misses:
+
+1. **Vocabulary gaps**: Same concepts described with different words
+2. **Cross-domain connections**: Ideas that span multiple topic clusters
+3. **Contrarian evidence**: Documents that disagree but are valuable for analysis
+4. **Tangential relevance**: Documents that aren't directly about the query but provide crucial context
+
+### What Serendipity Means in This System
+
+I define serendipity as: **Surfacing documents that the user didn't know to search for, but that meaningfully inform their query.**
+
+This is NOT random noise. It's structured diversity:
+
+* Documents from clusters the query didn't directly hit
+* Bridge documents that connect multiple topic areas
+* Documents sharing entities (people, places, dates) but discussing different aspects
+* High-centrality documents that many other documents reference
+
+### Current Serendipity Mechanisms
+
+I've implemented several mechanisms, but I'm not sure they're optimal:
+
+#### 1. Cluster-Based Diversity (Librarian Mode)
+
+The corpus is pre-clustered using Louvain community detection (~12-15 clusters). When the librarian scores clusters:
+
+* **High confidence clusters**: Load 100 docs
+* **Medium confidence clusters**: Load 30 docs
+* **Low confidence clusters**: Load 10 docs
+* **None confidence clusters**: Load 0 docs (but see Tier 2 below)
+
+This ensures even tangentially relevant clusters contribute documents.
+
+#### 2. Four-Tier Serendipity System (Librarian Mode)
+
+| Tier | Source | Purpose | Tokens |
+| --- | --- | --- | --- |
+| **Tier 1** | Confidence-weighted clusters | Primary relevant content | ~400K |
+| **Tier 2** | Samples from "none" clusters | Alternative perspectives from excluded areas | +100K |
+| **Tier 3** | Entity-matched docs | Documents sharing people/places/dates across ALL clusters | +100K |
+| **Tier 4** | Weighted random sampling | Bridge docs + high-centrality + random factor | +100K |
+
+**Tier 4 Scoring Formula:**
+
+    serendipity_score = (is_bridge * 0.4) + (centrality_score * 0.3) + (random * 0.3)
+
+Bridge documents connect multiple clusters. Centrality indicates influence in the document graph. Random adds controlled chaos.
+
+#### 3. Random Cluster Sampling (Direct Mode)
+
+In the faster direct mode, after summary vector search returns top 25 docs:
+
+    serendipity = get_random_cluster_samples(
+        exclude_transcript_ids=selected_ids,
+        samples_per_cluster=1,
+        max_clusters=5  # Add 5 docs from unrepresented clusters
+    )
+
+This ensures the top-25 results don't all come from the same cluster.
+
+#### 4. Query Expansion for Vocabulary Gaps
+
+    # LLM expands "tall whites" to:
+    ["tall whites", "Nordic aliens", "snow white hair",
+     "translucent skin", "Charles Hall", "Nellis AFB"]
+
+Each expanded term is searched separately, ensuring descriptive vocabulary finds documents even when categorical labels don't.
+
+#### 5. Hybrid FTS5 Supplementation
+
+After vector search, keyword search catches exact matches that embeddings might rank lower:
+
+    fts_chunks = _fts_keyword_search(expanded_terms, limit=30)
+
+### What's Wrong with Current Serendipity
+
+1. **Ad-hoc design**: The tier system was invented through experimentation, not principled information retrieval theory
+2. **Hard to tune**: Is 0.4/0.3/0.3 the right weighting? Should Tier 4 exist at all?
+3. **Clustering quality**: Louvain clustering is decent but some clusters are too broad (e.g., "General UFO" is huge)
+4. **No feedback loop**: I can't measure whether serendipitous results actually help users
+5. **Token budget tension**: More serendipity = more tokens = more cost and latency
+
+### Questions for the Expert (Serendipity Focus)
+
+1. **Is cluster-based serendipity the right approach?** Are there better diversity mechanisms (e.g., MMR - Maximal Marginal Relevance, DPP - Determinantal Point Processes)?
+
+2. **How do I maximize BOTH relevance AND diversity?** I need high precision AND serendipity—not a trade-off between them. What approaches achieve both?
+
+3. **Should serendipity be query-dependent?** Broad exploratory queries might want more diversity, while specific factual queries want precision.
+
+4. **Are bridge documents actually valuable?** They connect clusters but might be generic. Should I prioritize them or not?
+
+5. **How do I evaluate serendipity?** I can measure precision/recall for relevance, but how do I measure whether unexpected results are valuable?
+
+6. **Graph-based alternatives?** Should I use random walks, graph neural networks, or other graph algorithms instead of/alongside cluster sampling?
+
+7. **Entity linking for serendipity?** If two documents mention "Garry Nolan" but in different contexts, should I surface them together?
+
+
+* * *
+
+## Query Modes (I Have Too Many)
+
+I currently have **5 different query modes**. I suspect this is over-engineered and I should consolidate to 1-2 modes. Please advise.
+
+### Mode 1: Default (Direct Retrieval)
+
+**Command:** `ask "query"` or just typing in interactive mode**Time:** ~15-20s retrieval + ~30-40s synthesis = ~45-60s total
+
+**Pipeline:**
+
+    Query → Embed → Search summary embeddings (top 25 docs)
+         → Add 5 serendipity docs from unrepresented clusters
+         → Retrieve chunks from selected docs (5 per doc)
+         → Also vector search with expanded terms
+         → Hybrid FTS5 supplementation
+         → Rerank all chunks (Cohere Rerank 3.5)
+         → Analyst synthesis (Opus 4.5)
+
+**Pros:** Good balance of speed and coverage**Cons:** Summary search might miss documents with buried relevant content
+
+### Mode 2: Fast (Chunk Vector Search)
+
+**Command:** `ask -f "query"` or `/fast <query>`**Time:** ~10-15s retrieval + ~30-40s synthesis = ~40-55s total
+
+**Pipeline:**
+
+    Query → Expand query (LLM)
+         → Vector search each expanded term (chunks, not summaries)
+         → Hybrid FTS5 supplementation
+         → Rerank (Cohere Rerank 3.5)
+         → Analyst synthesis (Opus 4.5)
+
+**Pros:** Fastest, good for known-item searches**Cons:** No serendipity, no summary-level understanding, misses corpus-wide patterns
+
+### Mode 3: Librarian (Full Pipeline)
+
+**Command:** `ask -l "query"` or `/librarian <query>`**Time:** ~45-60s retrieval + ~30-40s synthesis = ~75-100s total
+
+**Pipeline:**
+
+    Query → Load corpus map (cluster structure)
+         → LLM scores ALL clusters by relevance (high/medium/low/none)
+         → Load summaries with confidence-weighted limits (400K+ tokens)
+         → Add Tier 2-4 serendipity docs (for diversity)
+         → Librarian LLM identifies relevant docs from summaries
+         → Retrieve chunks from identified docs
+         → Also vector search with expanded terms
+         → FTS5 supplementation
+         → Rerank
+         → Analyst synthesis
+
+**Pros:** Most thorough, best serendipity, corpus-wide awareness**Cons:** Slow, expensive (~$0.50+ per query), 1M context beta required
+
+### Mode 4: Deep Research (Multi-Agent)
+
+**Command:** `research "query"` or `/deep <query>`**Time:** ~3-5 minutes
+
+**Pipeline:**
+
+    Query → Spawn 3 parallel agents with different angles:
+            - Supporting evidence
+            - Skeptical/contrarian view
+            - Historical context / unexpected connections
+         → Each agent: 5 iterations of search + reasoning
+         → Merge findings
+         → Analyst synthesis
+
+**Pros:** Multiple perspectives, catches things single-pass misses**Cons:** Expensive (~$0.10-0.20), slower, may have redundant findings
+
+### Mode 5: Deep Max (Exhaustive Research)
+
+**Command:** `research -t max "query"` or `/deep:max <query>`**Time:** ~10-15 minutes
+
+**Pipeline:**
+
+    Query → Spawn 5 parallel agents (more angles)
+         → 20 iterations each
+         → Gap-filling agents (find what was missed)
+         → Pairwise comparison (every source vs every other)
+         → Analyst synthesis with extended thinking (16K budget)
+
+**Pros:** Most comprehensive possible**Cons:** Very expensive (~$1-2), very slow, overkill for most queries
+
+### Mode Consolidation Question
+
+**Should I:**
+
+1. Keep all 5 modes for different use cases?
+2. Consolidate to 2 modes (fast + thorough)?
+3. Create a single adaptive mode that chooses depth based on query complexity?
+4. Something else entirely?
+
+The synthesis step (Opus 4.5) takes ~30-40s regardless of retrieval mode, so retrieval optimization only saves ~10-30s.
+
+* * *
+
+## Corpus Characteristics
+
+| Metric | Value |
+| --- | --- |
+| Documents | ~1,600+ transcripts |
+| Total words | ~29.9 million |
+| Content type | Podcast transcripts, interview transcripts, book excerpts |
+| Domain | Specialized (UFO/paranormal research, consciousness studies) |
+| Document length | Varies: 2K - 150K words per document |
+| Update frequency | ~10-20 new documents per month |
+
+**Content characteristics:**
+
+* Long-form conversational content with multiple speakers
+* Domain-specific terminology that doesn't appear in standard training data
+* Frequent cross-references between documents (same guests across podcasts)
+* Named entities are critical: people, dates, locations, organizations
+* Semantic gaps: categorical labels (e.g., "Tall Whites") vs. descriptive language (e.g., "beings with snow-white hair")
+
+* * *
+
+## Architecture Overview
+
+                        ┌─────────────────────────────┐
+                        │    1,600+ Transcripts       │
+                        │      29.9M words            │
+                        └─────────────────────────────┘
+                                     │
+                                     ▼ (preprocessing)
+              ┌──────────────────────┴──────────────────────┐
+              │                                             │
+    ┌─────────────────────────────┐           ┌─────────────────────────────┐
+    │       corpus.db             │           │     corpus_graph.db         │
+    │  • 500-word summaries       │           │  • Document clusters        │
+    │  • Summary embeddings       │           │  • Entity extraction        │
+    │  • Text chunks + embeddings │           │  • Document relationships   │
+    │  • sqlite-vec for ANN       │           │  • Bridge doc identification│
+    └─────────────────────────────┘           └─────────────────────────────┘
+              │                                             │
+              ├───────────────────┬─────────────────────────┤
+              │                   │                         │
+              │       ┌─────────────────────────────┐       │
+              │       │     fts5_index.db           │       │
+              │       │  • FTS5 full-text search    │       │
+              │       │  • Keyword/proximity search │       │
+              │       └─────────────────────────────┘       │
+              │                                             │
+              └──────────────────────┬──────────────────────┘
+                                     │
+                                     ▼
+                        [Query-time retrieval pipeline]
+
+* * *
+
+## Component Specifications
+
+### Preprocessing
+
+**Chunking:**
+
+* Token-based: 500 tokens (tiktoken cl100k_base)
+* Overlap: 50 tokens
+* Separators: `["\n\n", "\n", ". ", " "]` (recursive semantic splitting)
+
+**Summarization:**
+
+* Model: Claude Sonnet 4.5
+* Target: 500-1000 words per document
+* Structure: Entity-preserving (Overview, Key Claims, Notable Entities, Connections)
+* Hierarchical: Documents >80K chars use 2-stage summarization
+
+**Embeddings:**
+
+* Model: Cohere Embed V4 via AWS Bedrock
+* Dimensions: 1536
+* Batch size: 96 (Cohere max)
+
+### Database Schema
+
+    -- corpus.db
+    transcripts (id, file_path, title, date, speakers, word_count, summary)
+    chunks (id, transcript_id, chunk_index, text, start_char, end_char)
+    vec_chunks USING vec0 (chunk_id, embedding FLOAT[1536])  -- sqlite-vec
+    vec_summaries USING vec0 (transcript_id, embedding FLOAT[1536])
+
+    -- corpus_graph.db
+    document_entities (document_id, entity_text, entity_type, frequency)
+    document_keywords (document_id, keyword, tfidf_score)
+    corpus_edges (source_id, target_id, embedding_sim, entity_overlap, keyword_overlap, edge_type)
+    document_clusters (document_id, cluster_id, centrality_score, is_bridge)
+    clusters (cluster_id, name, size, top_keywords, top_entities)
+
+    -- fts5_index.db
+    documents_fts (title, content, folder, speakers)  -- FTS5 virtual table
+
+### Graph Construction
+
+**Edge thresholds:**
+
+* Embedding similarity: ≥0.3 cosine
+* Entity overlap: ≥0.05 Jaccard
+* Keyword overlap: ≥0.08 Jaccard
+
+**Clustering:** NetworkX Louvain algorithm (resolution=1.0)
+
+**Bridge identification:** Documents with edges to 3+ different clusters
+
+### Reranking
+
+* Model: Cohere Rerank 3.5 via API Gateway → Bedrock
+* retrieve_k: 200 (fetch before reranking)
+* top_k: 25-50 (keep after reranking)
+
+### Synthesis
+
+* Model: Claude Opus 4.5 via AWS Bedrock
+* Extended thinking: Available for deep research (16K token budget)
+* Output structure: Direct Answer → Connections → Rabbit Holes → Sources
+
+* * *
+
+## Performance Characteristics
+
+| Mode | Retrieval | Synthesis | Total | Sources | Serendipity |
+| --- | --- | --- | --- | --- | --- |
+| Fast | ~10-15s | ~30-40s | ~40-55s | 20-30 | None |
+| Default | ~15-20s | ~30-40s | ~45-60s | 25-50 | Cluster sampling |
+| Librarian | ~45-60s | ~30-40s | ~75-100s | 50-100 | Full 4-tier |
+| Deep | ~3-5min | ~30-40s | ~4-6min | 100+ | Multi-angle |
+| Deep Max | ~10-15min | ~60s | ~12-16min | 200+ | Exhaustive |
+
+**Bottleneck:** Synthesis is consistently 30-40s regardless of retrieval. Retrieval optimization only saves 10-30s.
+
+* * *
+
+## Current Pain Points
+
+1. **Too many modes**: 5 modes is confusing. Which should users choose?
+2. **Serendipity is ad-hoc**: The tier system works but feels unprincipled
+3. **Vocabulary gaps persist**: Query expansion helps but isn't perfect
+4. **Long document problem**: Documents >50K words may have buried relevant content
+5. **Entity disambiguation**: Same person with name variations across sources
+6. **Latency**: 45-60s feels slow for interactive use
+7. **No evaluation framework**: Can't measure if changes improve quality
+
+* * *
+
+## Technical Stack
+
+* **Runtime:** Python 3.11, asyncio
+* **Database:** SQLite + sqlite-vec extension
+* **Embeddings:** Cohere Embed V4 (1536d) via AWS Bedrock
+* **Reranking:** Cohere Rerank 3.5 via AWS Bedrock
+* **LLMs:** Claude Sonnet 4.5 (retrieval), Claude Opus 4.5 (synthesis) via AWS Bedrock
+* **NER:** spaCy en_core_web_sm
+* **Clustering:** NetworkX Louvain
+* **TF-IDF:** scikit-learn TfidfVectorizer
+* **Full-text:** SQLite FTS5
+
+* * *
+
+## Configuration
+
+    {
+        "bedrock": {
+            "models": {
+                "librarian": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "librarian_1m": true,
+                "analyst": "global.anthropic.claude-opus-4-5-20251101-v1:0",
+                "summarizer": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "embeddings": "us.cohere.embed-v4:0"
+            }
+        },
+        "reranking": {
+            "enabled": true,
+            "retrieve_k": 200,
+            "top_k": 25
+        },
+        "search": {
+            "n_results": 20,
+            "chunk_size": 500,
+            "chunk_overlap": 50
+        }
+    }
+
+* * *
+
+## Summary of Questions
+
+### Accuracy (Priority 1)
+
+1. How do I maximize recall without drowning in noise? I want ALL relevant sources but can only show 25-50 chunks.
+2. Is query expansion sufficient for vocabulary gaps? Should I build a domain-specific synonym dictionary?
+3. How do I handle long documents where relevant content is buried? Multiple summaries? Sliding window?
+4. Should I use entity normalization to map name variants to canonical forms?
+5. What retrieval patterns maximize accuracy? Multi-query? Iterative refinement? HyDE?
+6. How do I know if I'm missing relevant sources? Evaluation strategies when ground truth doesn't exist?
+
+### Speed (Priority 2)
+
+7. Can I reduce synthesis latency without losing quality? Would Sonnet suffice? Smaller context?
+8. Should I pre-compute more? Cached answers for common patterns? Query clustering?
+9. Is reranking worth 3-5s? Does accuracy gain justify latency?
+10. Can retrieval be faster? Better ANN? Approximate reranking? Fewer stages?
+11. Should I use speculative execution? Start synthesis with partial results?
+12. What's theoretical minimum latency for high-quality RAG on 30M words?
+13. Should I show intermediate results while synthesis runs?
+
+### Serendipity (Priority 3)
+
+14. Is cluster-based serendipity the right approach? Better alternatives (MMR, DPP)?
+15. How do I maximize BOTH relevance AND diversity simultaneously? Not a trade-off—I need both.
+16. Should serendipity be query-dependent? (exploratory = more diversity, factual = precision)
+17. Are bridge documents valuable, or just generic documents touching many topics superficially?
+18. How do I evaluate serendipity? Metrics for "valuable unexpected results"?
+19. Should I use graph-based alternatives (random walks, personalized PageRank, GNNs)?
+20. Should entity linking drive serendipity? Surface all docs mentioning same person regardless of cluster?
+
+### Mode Consolidation
+
+21. Should I keep 5 modes or consolidate to 1-2?
+22. Can I create a single adaptive mode that auto-selects depth based on query complexity?
+23. Is multi-agent research fundamentally different, or can it fold into a single pipeline?
+
+### Retrieval Architecture
+
+24. Is summary-first → chunk-second the right two-stage pattern?
+25. Is 500-token chunking optimal? Late chunking? Contextual chunking? Variable sizes?
+26. Better hybrid search patterns? Reciprocal rank fusion? Learned sparse-dense fusion?
+27. Should reranking happen at document level, chunk level, or both?
+28. Is retrieve_k=200 → rerank → top_k=25 the right ratio?
+
+### Embedding & Summarization
+
+29. Is Cohere Embed V4 the best choice? (vs. OpenAI, Voyage, Jina, etc.)
+30. Should summary embeddings use a different model than chunk embeddings?
+31. Should I fine-tune embeddings on this domain's vocabulary?
+32. Is my summarization prompt optimal? More structured or more narrative?
+33. For long documents, is hierarchical summarization right, or multiple section-level summaries?
+
+### Graph & Clustering
+
+34. Is Louvain the right clustering algorithm? HDBSCAN? Spectral? Hierarchical?
+35. Are edge thresholds well-tuned (0.3 cosine, 0.05 entity Jaccard, 0.08 keyword Jaccard)?
+36. Should clusters be hierarchical for finer-grained serendipity?
+
+### Cutting-Edge Approaches
+
+37. What recent RAG advances should I consider? (ColBERT, RAG-Fusion, self-RAG, corrective RAG, RAPTOR?)
+38. Would a knowledge graph (entities + relations) outperform my document graph?
+39. Should I use agentic RAG that iteratively refines search based on results?
+
+### Evaluation
+
+40. How do I systematically evaluate accuracy AND serendipity together?
+41. Should I build a human evaluation benchmark, or are there automated proxy metrics?
+
+* * *
+
+Please provide your analysis and recommendations. Remember: **Accuracy, Speed, and Serendipity are ALL non-negotiable.** I need to maximize all three simultaneously.
+
+Focus on:
+
+1. **Accuracy** - How do I ensure I never miss relevant sources? What am I doing wrong?
+2. **Speed** - How do I get to <30s without sacrificing accuracy or serendipity? Is synthesis the real blocker?
+3. **Serendipity** - Is my approach principled or ad-hoc? What would you do differently to maximize unexpected valuable discoveries?
+4. **Mode consolidation** - Can I have ONE mode that maximizes all three metrics? What would it look like?
+5. **Architecture critique** - What's working? What's over-engineered? What's missing? What would YOU build to maximize accuracy + speed + serendipity?
